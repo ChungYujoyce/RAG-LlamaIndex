@@ -1,12 +1,30 @@
 import os
 import chainlit as cl
+import pickle
 
 from llama_index.core import Settings, VectorStoreIndex,SimpleDirectoryReader, StorageContext, PromptTemplate
 from llama_index.llms.openai_like import OpenAILike
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.embeddings.instructor import InstructorEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.core.tools import RetrieverTool
+from llama_index.core.retrievers import RouterRetriever
+
+from llama_index.retrievers.bm25 import BM25Retriever
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core.retrievers import BaseRetriever
+from llama_index.core.postprocessor import SentenceTransformerRerank
+
 import chromadb
+
+LLM = OpenAILike(
+        model="llama3-8b-instruct", 
+        api_base="http://vllm:8000/v1", 
+        api_key="fake",
+        temperature=0.0,
+        max_tokens=256,
+    )
 
 # openai.api_key = os.environ.get("OPENAI_API_KEY")
 # pinecone_api_key = os.environ.get("PINECONE_API_KEY")
@@ -40,22 +58,88 @@ CONVERSATION_PROMPT = "<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|
 RESPONSE_PROMPT = "<|start_header_id|>{role}<|end_header_id|>\n\n"
 EMBEDDING = os.getenv("EMBEDDING", "hkunlp/instructor-xl")
 
+with open("nodes.pickle", 'rb') as f:
+    global nodes
+    nodes = pickle.load(f)
+
+
 def load_chroma_vector_store():
     chroma_client = chromadb.PersistentClient("./chroma_db")
-    chroma_collection = chroma_client.get_collection("quickstart")
+    chroma_collection = chroma_client.get_collection("test")
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 
     return vector_store
 
+
+def build_router_retriever_query_engine(index):
+    vector_retriever = VectorIndexRetriever(index)
+    bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=2)
+
+    retriever_tools = [
+        RetrieverTool.from_defaults(
+            retriever=vector_retriever,
+            description="Useful in most cases",
+        ),
+        RetrieverTool.from_defaults(
+            retriever=bm25_retriever,
+            description="Useful if searching about specific information",
+        ),
+    ]
+    router_retriever = RouterRetriever.from_defaults(
+        retriever_tools=retriever_tools,
+        llm=LLM,
+        select_multi=True,
+    )
+
+    query_engine = RetrieverQueryEngine.from_args(
+        retriever=router_retriever,
+        streaming=True,
+        text_qa_template=SYS_PROMPT,
+    )
+    return query_engine
+
+
+# Advanced - Hybrid Retriever + Re-Ranking
+class HybridRetriever(BaseRetriever):
+    def __init__(self, vector_retriever, bm25_retriever):
+        self.vector_retriever = vector_retriever
+        self.bm25_retriever = bm25_retriever
+        super().__init__()
+
+    def _retrieve(self, query, **kwargs):
+        bm25_nodes = self.bm25_retriever.retrieve(query, **kwargs)
+        vector_nodes = self.vector_retriever.retrieve(query, **kwargs)
+
+        # combine the two lists of nodes
+        all_nodes = []
+        node_ids = set()
+        for n in bm25_nodes + vector_nodes:
+            if n.node.node_id not in node_ids:
+                all_nodes.append(n)
+                node_ids.add(n.node.node_id)
+        return all_nodes
+
+
+def hybrid_retriver_reranking_query_engine(index):
+    vector_retriever = index.as_retriever(similarity_top_k=10)
+    bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=4)
+    
+
+    hybrid_retriever = HybridRetriever(vector_retriever, bm25_retriever)
+    reranker = SentenceTransformerRerank(top_n=4, model="BAAI/bge-reranker-base")
+
+    query_engine = RetrieverQueryEngine.from_args(
+        retriever=bm25_retriever,
+        # node_postprocessors=[reranker],
+        llm=LLM,
+        streaming=True,
+        text_qa_template=SYS_PROMPT,
+    )
+    return query_engine
+
 @cl.cache
 def load_context():
-    Settings.llm = OpenAILike(
-        model="llama3-8b-instruct", 
-        api_base="http://vllm:8000/v1", 
-        api_key="fake",
-        temperature=0.0,
-        max_tokens=256,
-    )
+    Settings.llm = LLM
     Settings.embed_model = InstructorEmbedding(model_name="hkunlp/instructor-xl")
     Settings.num_output = 1024
     Settings.context_window = 8192
@@ -72,13 +156,10 @@ def load_context():
 async def start():
     index = load_context()
 
-    query_engine = index.as_query_engine(
-        streaming=True,
-        similarity_top_k=4,
-        text_qa_template=SYS_PROMPT,
-        vector_store_query_mode="hybrid",
-    )
-    cl.user_session.set("query_engine", query_engine)
+    query_engine1 = build_router_retriever_query_engine(index)
+    query_engine2 = hybrid_retriver_reranking_query_engine(index)
+    
+    cl.user_session.set("query_engine", query_engine2)
 
     message_history = []
     cl.user_session.set("message_history", message_history)
@@ -92,16 +173,21 @@ async def set_sources(response, response_message):
     label_list = []
     count = 1
     for sr in response.source_nodes:
+        chroma_client = chromadb.PersistentClient("./chroma_db")
+        chroma_collection = chroma_client.get_collection("test")
+        node = chroma_collection.get(ids = sr.id_)
+        # print(n.metadata['file_name'], n.id_)
+        print("-" * 10, sr)
         elements = [
             cl.Text(
-                name="S" + str(count),
+                name=str(node["metadatas"][0]["file_name"]),
                 content=f"{sr.node.text}",
                 display="side",
                 size="small",
             )
         ]
         response_message.elements = elements
-        label_list.append("S" + str(count))
+        label_list.append(str(node["metadatas"][0]["file_name"]))
         await response_message.update()
         count += 1
     response_message.content += "\n\nSources: " + ", ".join(label_list)

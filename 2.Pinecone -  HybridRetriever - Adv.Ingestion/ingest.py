@@ -1,7 +1,7 @@
 import os
 import openai
 import asyncio
-import argparse
+import pickle
 
 from dotenv import load_dotenv
 # from pinecone import Pinecone, PodSpec
@@ -22,11 +22,6 @@ from llama_index.embeddings.instructor import InstructorEmbedding
 from chromadb.config import Settings
 import chromadb
 
-CHROMA_SETTINGS = Settings(
-    anonymized_telemetry=False,
-    is_persistent=True,
-)
-
 
 from llama_index.core.extractors import (
     TitleExtractor,
@@ -46,20 +41,24 @@ EMBEDDING = "hkunlp/instructor-xl"
 
 def create_chroma_vector_store(path):
     chroma_client = chromadb.PersistentClient("./chroma_db")
-    chroma_collection = chroma_client.create_collection("quickstart")
+    # chroma_client.delete_collection(name="quickstart")
+    chroma_collection = chroma_client.create_collection("test")
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
     return vector_store
 
 def load_chroma_vector_store():
     chroma_client = chromadb.PersistentClient("./chroma_db")
-    chroma_collection = chroma_client.get_collection("quickstart")
+    chroma_collection = chroma_client.get_collection("test")
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
     return vector_store
 
 
 def get_documents(input_dir):
+
+    parsing_instruction = """Do not parse images"""
     llama_parser = LlamaParse(
-        api_key=llama_parse_api_key, result_type="markdown", verbose=True
+        api_key=llama_parse_api_key, result_type="markdown", verbose=True, parsing_instruction=parsing_instruction
+
     )
 
     file_extractor = {
@@ -79,7 +78,7 @@ def get_documents(input_dir):
 def run_pipeline(documents, vector_store, llm, num_workers):
     pipeline = IngestionPipeline(
         transformations=[
-            SentenceSplitter(chunk_size=512, chunk_overlap=126),
+            SentenceSplitter(chunk_size=512, chunk_overlap=32),
             # [TODO] TitleExtractor(llm=llm, num_workers=num_workers),
             # QuestionsAnsweredExtractor(questions=3, llm=llm, num_workers=num_workers),
             # SummaryExtractor(
@@ -94,7 +93,10 @@ def run_pipeline(documents, vector_store, llm, num_workers):
     for doc in documents:  # Small patch to remove last_accessed_date from metadata
         k = vars(doc)
         del k["metadata"]["last_modified_date"]
-    pipeline.run(documents=documents, show_progress=True, num_workers=num_workers)
+    nodes = pipeline.run(documents=documents, show_progress=True, num_workers=num_workers)
+
+    with open("nodes.pickle", 'wb') as f:
+        pickle.dump(nodes, f)
 
 
 def main():
