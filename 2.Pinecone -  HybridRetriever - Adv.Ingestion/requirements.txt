@@ -3,7 +3,7 @@ chromadb
 llama-hub
 llama-index
 llama-parse
-llama-index-core        # Feb 21 2024
+llama-index-core
 llama-index-vector-stores-chroma
 llama-index-embeddings-huggingface
 llama-index-llms-openai-like
