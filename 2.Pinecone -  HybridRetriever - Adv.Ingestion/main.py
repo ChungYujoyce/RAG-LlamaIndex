@@ -1,6 +1,7 @@
-import os
+import os, re
 import chainlit as cl
 import pickle
+from typing import List
 
 from llama_index.core import Settings, VectorStoreIndex,SimpleDirectoryReader, StorageContext, PromptTemplate
 from llama_index.llms.openai_like import OpenAILike
@@ -17,6 +18,11 @@ from llama_index.core.retrievers import BaseRetriever
 from llama_index.core.postprocessor import SentenceTransformerRerank
 
 import chromadb
+import nltk
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
 
 LLM = OpenAILike(
         model="llama3-8b-instruct", 
@@ -63,12 +69,39 @@ with open("nodes.pickle", 'rb') as f:
     nodes = pickle.load(f)
 
 
-def load_chroma_vector_store():
-    chroma_client = chromadb.PersistentClient("./chroma_db")
+def load_chroma_vector_store(path):
+    chroma_client = chromadb.PersistentClient(path)
     chroma_collection = chroma_client.get_collection("test")
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 
     return vector_store
+
+
+def clean_text(text: str) -> List[str]:
+        
+        # Convert text to lowercase
+        text = text.lower()
+        
+        # Remove stopwords from text using regex
+        stopwords_list = set(nltk.corpus.stopwords.words('english'))
+        stopwords_pattern = r'\b(?:{})\b'.format('|'.join(stopwords_list))
+        text = re.sub(stopwords_pattern, '', text)
+
+        # Replace punctuation, newline, tab with space
+        text = re.sub(r'[,.!?|]|[\n\t]', ' ', text)
+        # Replace multiple spaces with single space
+        text = re.sub(r'\s+', ' ', text)
+        # remove # from markdown
+        text = re.sub(r'#+', '', text)
+        text = re.sub(r'<[^>]*>', '', text)
+
+        # remove from user query
+        text = re.sub(r'assistant', '', text)
+        text = re.sub(r'user', '', text)
+        
+        text = text.strip().split(" ")
+        text = [t for t in text if t != "-" and t != ""]
+        return text
 
 
 def build_router_retriever_query_engine(index):
@@ -122,29 +155,33 @@ class HybridRetriever(BaseRetriever):
 
 def hybrid_retriver_reranking_query_engine(index):
     vector_retriever = index.as_retriever(similarity_top_k=10)
-    bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=4)
-    
+    bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, 
+                                                tokenizer=clean_text,
+                                                similarity_top_k=4)
 
     hybrid_retriever = HybridRetriever(vector_retriever, bm25_retriever)
+    # step_decompose_transform = StepDecomposeQueryTransform(llm=LLM, verbose=True)
     reranker = SentenceTransformerRerank(top_n=4, model="BAAI/bge-reranker-base")
 
     query_engine = RetrieverQueryEngine.from_args(
         retriever=bm25_retriever,
         # node_postprocessors=[reranker],
-        llm=LLM,
+        # llm=LLM,
         streaming=True,
+        # query_transform=step_decompose_transform,
         text_qa_template=SYS_PROMPT,
     )
+
     return query_engine
 
 @cl.cache
 def load_context():
     Settings.llm = LLM
     Settings.embed_model = InstructorEmbedding(model_name="hkunlp/instructor-xl")
-    Settings.num_output = 1024
+    Settings.num_output = 2048
     Settings.context_window = 8192
     
-    vector_store = load_chroma_vector_store()
+    vector_store = load_chroma_vector_store("./chroma_db")
 
     index = VectorStoreIndex.from_vector_store(
         vector_store=vector_store,
@@ -172,22 +209,27 @@ async def start():
 async def set_sources(response, response_message):
     label_list = []
     count = 1
+
+    above_zero_nodes = []
     for sr in response.source_nodes:
+        if sr.get_score() > 0:
+            above_zero_nodes.append(sr)
+
+    for sr in above_zero_nodes:
         chroma_client = chromadb.PersistentClient("./chroma_db")
         chroma_collection = chroma_client.get_collection("test")
         node = chroma_collection.get(ids = sr.id_)
-        # print(n.metadata['file_name'], n.id_)
         print("-" * 10, sr)
         elements = [
             cl.Text(
-                name=str(node["metadatas"][0]["file_name"]),
+                name=str(node["metadatas"][0]["file_name"]) + str(count),
                 content=f"{sr.node.text}",
                 display="side",
                 size="small",
             )
         ]
         response_message.elements = elements
-        label_list.append(str(node["metadatas"][0]["file_name"]))
+        label_list.append(str(node["metadatas"][0]["file_name"])+ str(count))
         await response_message.update()
         count += 1
     response_message.content += "\n\nSources: " + ", ".join(label_list)
